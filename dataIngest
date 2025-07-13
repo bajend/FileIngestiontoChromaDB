@@ -1,0 +1,239 @@
+import chromadb
+import os
+import re
+import shutil
+import logging
+import time
+import pandas as pd
+from pptx import Presentation
+from PyPDF2 import PdfReader
+import csv
+
+# --- Configuration ---
+PERSIST_DIRECTORY = "./chroma"
+COLLECTION_NAME = "customerfeedback"  # Note: This collection is initialized but the script currently ingests into subfolder collections.
+CHUNK_SIZE = 500
+FOLDER = "CustomerFeedback"
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
+# -----------------
+# Utility Functions
+# -----------------
+
+def check_write_permissions(directory: str) -> bool:
+    """Verifies write permissions for the specified directory, creating it if necessary."""
+    if not os.path.exists(directory):
+        logger.info(f"Directory '{directory}' does not exist. Attempting to create.")
+        try:
+            os.makedirs(directory)
+            logger.info("Directory created successfully.")
+        except OSError as e:
+            logger.error(f"Failed to create directory '{directory}': {e}")
+            return False
+
+    if os.access(directory, os.W_OK):
+        logger.info(f"Write permissions confirmed for '{directory}'.")
+        return True
+    else:
+        logger.error(f"No write permissions for '{directory}'.")
+        return False
+
+# ---------------------
+# Text Extraction Helpers
+# ---------------------
+
+def _clean_text(text: str) -> str:
+    """Removes special characters, keeping basic punctuation."""
+    # Remove any null bytes first
+    text = text.replace('\x00', '')
+    # Retains alphanumeric characters, spaces, and common punctuation (.,!?)
+    return re.sub(r'[^\w\s.,!?]', '', text)
+
+def _extract_pptx(file_path: str) -> str:
+    """Extracts text from a PowerPoint file."""
+    text = ""
+    try:
+        prs = Presentation(file_path)
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    # Only extract text if the shape is a text placeholder
+                    text += shape.text + "\n"
+    except Exception as e:
+        logger.error(f"Failed to extract text from PPTX '{file_path}': {e}")
+    return _clean_text(text)
+
+def _extract_pdf(file_path: str) -> str:
+    """Extracts text from a PDF file."""
+    text = ""
+    try:
+        reader = PdfReader(file_path)
+        for page in reader.pages:
+            text += page.extract_text() or ""
+    except Exception as e:
+        logger.error(f"Failed to extract text from PDF '{file_path}': {e}")
+    return _clean_text(text)
+
+def _extract_csv(file_path: str) -> str:
+    """Extracts text from a CSV file."""
+    text = ""
+    try:
+        with open(file_path, newline='', encoding='utf-8') as csvfile:
+            reader = csv.reader(csvfile)
+            for row in reader:
+                # Join all columns in the row with a space
+                text += ' '.join(row) + "\n"
+    except Exception as e:
+        logger.error(f"Failed to extract text from CSV '{file_path}': {e}")
+    return _clean_text(text)
+
+def _extract_excel(file_path: str) -> str:
+    """Extracts text from an Excel file (XLS, XLSX)."""
+    text = ""
+    try:
+        # Read all sheets using ExcelFile
+        xls = pd.ExcelFile(file_path)
+        for sheet_name in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=sheet_name)
+            # Convert DataFrame to a readable string format
+            text += f"Sheet: {sheet_name}\n"
+            text += df.to_string(index=False) + "\n\n"
+    except Exception as e:
+        logger.error(f"Failed to extract text from Excel '{file_path}': {e}")
+    return _clean_text(text)
+
+def extract_text(file_path: str) -> str:
+    """Dispatches file extraction based on file extension."""
+    extension = os.path.splitext(file_path)[1].lower()
+
+    if extension in ('.ppt', '.pptx'):
+        return _extract_pptx(file_path)
+    elif extension == '.pdf':
+        return _extract_pdf(file_path)
+    elif extension == '.csv':
+        return _extract_csv(file_path)
+    elif extension in ('.xls', '.xlsx'):
+        return _extract_excel(file_path)
+    else:
+        logger.warning(f"Unsupported file type for '{file_path}'.")
+        return ""
+
+# -----------------
+# Main Ingestion Logic
+# -----------------
+
+def run_ingestion():
+    """Main function to ingest documents from the CustomerFeedback folder into ChromaDB."""
+    
+    start_time = time.time()
+    logger.info("--- ChromaDB Ingestion Process Starting ---")
+    logger.info(f"Using persistence directory: {os.path.abspath(PERSIST_DIRECTORY)}")
+
+    # 1. Cleanup and permissions check
+    if os.path.exists(PERSIST_DIRECTORY):
+        logger.info(f"Deleting existing directory: {PERSIST_DIRECTORY}")
+        shutil.rmtree(PERSIST_DIRECTORY)
+
+    if not check_write_permissions(PERSIST_DIRECTORY):
+        logger.error("Cannot proceed. Ensure the script has write permissions to the specified directory.")
+        return
+
+    # 2. Initialize ChromaDB Client
+    logger.info("Initializing PersistentClient...")
+    try:
+        client = chromadb.PersistentClient(path=PERSIST_DIRECTORY)
+        logger.info("PersistentClient initialized successfully.")
+    except Exception as e:
+        logger.error(f"Failed to initialize ChromaDB Client: {e}")
+        return
+
+    # 3. Process subfolders (representing different collections)
+    if not os.path.exists(FOLDER):
+        logger.error(f"Folder '{FOLDER}' does not exist.")
+        return
+
+    subfolders = [d for d in os.listdir(FOLDER) if os.path.isdir(os.path.join(FOLDER, d))]
+    if not subfolders:
+        logger.info(f"No subfolders found in '{FOLDER}'.")
+        return
+
+    logger.info(f"Found {len(subfolders)} subfolders in '{FOLDER}'.")
+    
+    total_ingested_chunks = 0
+
+    for subfolder in subfolders:
+        subfolder_path = os.path.join(FOLDER, subfolder)
+        
+        # Identify supported files
+        files = [f for f in os.listdir(subfolder_path) if os.path.splitext(f)[1].lower() in ('.ppt', '.pptx', '.pdf', '.csv', '.xls', '.xlsx')]
+        
+        if not files:
+            logger.info(f"No supported files found in '{subfolder}'. Skipping.")
+            continue
+
+        # Create or get collection for the current subfolder
+        logger.info(f"--- Ingesting '{subfolder}' into ChromaDB collection ---")
+        try:
+            collection = client.get_or_create_collection(name=subfolder)
+            logger.info(f"Collection '{subfolder}' ready.")
+        except Exception as e:
+            logger.error(f"Failed to create or get collection '{subfolder}': {e}")
+            continue
+
+        collection_chunks = 0
+        file_document_counts = {}
+
+        for filename in files:
+            file_path = os.path.join(subfolder_path, filename)
+            logger.info(f"Processing: '{filename}'")
+
+            # Extract text
+            text = extract_text(file_path)
+            if not text:
+                continue
+
+            # Chunk the text
+            chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
+            
+            # Prepare documents and IDs for insertion
+            documents = []
+            ids = []
+            
+            for idx, chunk in enumerate(chunks):
+                if chunk.strip():
+                    chunk_with_context = f"[Source: {filename}]\n{chunk}"
+                    documents.append(chunk_with_context)
+                    ids.append(f"{filename}_chunk{idx}")
+            
+            # Insert chunks into ChromaDB
+            if documents:
+                try:
+                    # Note: ChromaDB handles the embedding process automatically during `add()`
+                    collection.add(
+                        documents=documents,
+                        ids=ids
+                    )
+                    collection_chunks += len(documents)
+                    file_document_counts[filename] = len(documents)
+                    logger.info(f"Successfully inserted {len(documents)} chunks from '{filename}'.")
+                except Exception as e:
+                    logger.error(f"Failed to insert chunks from '{filename}': {e}")
+        
+        total_ingested_chunks += collection_chunks
+        logger.info(f"\n[SUMMARY] Ingestion completed for collection '{subfolder}'. Total chunks: {collection_chunks}")
+        
+        # Print document count summary for the collection
+        logger.info("Document count per file in this collection:")
+        for filename, count in file_document_counts.items():
+            logger.info(f"  File: {filename} | Documents (chunks): {count}")
+
+    end_time = time.time()
+    logger.info("-" * 40)
+    logger.info(f"Ingestion process complete. Total chunks ingested: {total_ingested_chunks}")
+    logger.info(f"Total time elapsed: {end_time - start_time:.2f} seconds")
+
+if __name__ == "__main__":
+    run_ingestion()
